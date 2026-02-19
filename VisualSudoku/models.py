@@ -1,11 +1,12 @@
 import torch
+import torch.nn.functional as F
 from torch.distributions import Uniform, TransformedDistribution, SigmoidTransform, AffineTransform
 import math
 from torch.distributions import Gumbel
 
 
 class MNIST_Net(torch.nn.Module):
-    def __init__(self, N=9, channels=1):
+    def __init__(self, N=9, channels=1, use_activation=False):
         super(MNIST_Net, self).__init__()
         self.encoder = torch.nn.Sequential(
             torch.nn.Conv2d(channels, 6, 5),
@@ -24,6 +25,7 @@ class MNIST_Net(torch.nn.Module):
             torch.nn.Linear(84, N)
         )
         self.channels = channels
+        self.use_activation = use_activation
 
     def weights_init(self, m):
         if isinstance(m, torch.nn.Conv2d):
@@ -41,34 +43,43 @@ class MNIST_Net(torch.nn.Module):
         x = x.view(-1, 16 * 4 * 4)
         x = self.classifier_mid(x)
         x = self.classifier(x)
+        if self.use_activation:
+            x = F.log_softmax(x, dim=-1)
         return x
 
 
-def logistic_distribution(mean=0.0, std_dev=1.0):
-    scale = std_dev * math.sqrt(3) / math.pi
-
-    base_distribution = Uniform(0, 1)
-    transforms = [SigmoidTransform().inv, AffineTransform(loc=mean, scale=scale)]
-    logistic = TransformedDistribution(base_distribution, transforms)
-
-    return logistic
-
-
 def check(ti, tj):
-    '''Check if ti and tj are different
+    '''Check if ti and tj are different (logits: -ti corresponds to 1-ti on probs).
 
-    :param ti: truth values of first cell
-    :param tj: truth values of second cell
+    :param ti: truth values of first cell (logits)
+    :param tj: truth values of second cell (logits)
     :return: vector of truth values representing satisfaction of the constraints for each pair of digits
     '''
     return torch.max(-ti, -tj)
 
 
+def negation_log_probs(L):
+    '''For each position k: log(sum of softmax over all j != k) = log(sum_{j!=k} exp(L[j])).'''
+    # L shape (..., 9). For each k compute logsumexp over indices j != k.
+    out = torch.empty_like(L)
+    for k in range(L.shape[-1]):
+        mask = torch.arange(L.shape[-1], device=L.device, dtype=torch.long) != k
+        out[..., k] = torch.logsumexp(L[..., mask], dim=-1)
+    return out
+
+
+def check_log_probs(ti, tj):
+    '''Max of two negations: each negation = log(sum of other softmax values).'''
+    return torch.max(negation_log_probs(ti), negation_log_probs(tj))
+
+
 class SudokuModel(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, use_noise=True):
         super(SudokuModel, self).__init__()
-        self.MNIST_model = MNIST_Net()
+        # When use_noise=False, MNIST_Net applies log_softmax (outputs are log-probabilities)
+        self.MNIST_model = MNIST_Net(use_activation=not use_noise)
         self.distribution = Gumbel(0, 1)
+        self.use_noise = use_noise
 
     def forward(self, x):
         batch_size = x.shape[0]
@@ -76,16 +87,18 @@ class SudokuModel(torch.nn.Module):
         images = x.view(-1, 1, 28, 28)
         boards = self.MNIST_model(images).view(batch_size, 9, 9, 9)
 
-        if self.training:
-            sampled_boards = boards + self.distribution.sample(sample_shape=boards.shape).to(boards.device)
+        if self.use_noise:
+            if self.training:
+                sampled_boards = boards + self.distribution.sample(sample_shape=boards.shape).to(boards.device)
+            else:
+                sampled_boards = boards
+            # Normalization (scaling factor)
+            top2_x, idx_x = torch.topk(sampled_boards, 2, dim=-1)
+            scaling_factor_x = (top2_x[:, :, :, 0] + top2_x[:, :, :, 1]) / 2
+            sampled_boards = sampled_boards - scaling_factor_x.unsqueeze(-1)
         else:
+            # No noise: boards are log-probabilities (log_softmax applied in MNIST_Net)
             sampled_boards = boards
-
-
-        # Normalization
-        top2_x, idx_x = torch.topk(sampled_boards, 2, dim=-1)
-        scaling_factor_x = (top2_x[:, :, :, 0] + top2_x[:, :, :, 1]) / 2
-        sampled_boards = sampled_boards - scaling_factor_x.unsqueeze(-1)
 
 
         # Blocks definition
@@ -104,16 +117,17 @@ class SudokuModel(torch.nn.Module):
         ix_pairs = ix[identity_mask]
         iy_pairs = iy[identity_mask]
 
-        # Rows and columns constraints
-        rows_different = check(sampled_boards[:, :, ix_pairs, :], sampled_boards[:, :, iy_pairs, :])
-        cols_different = check(sampled_boards[:, ix_pairs, :, :], sampled_boards[:, iy_pairs, :, :])
+        # Rows and columns constraints (logits: -ti; log-space: log1p(-exp(L)))
+        diff_fn = check_log_probs if not self.use_noise else check
+        rows_different = diff_fn(sampled_boards[:, :, ix_pairs, :], sampled_boards[:, :, iy_pairs, :])
+        cols_different = diff_fn(sampled_boards[:, ix_pairs, :, :], sampled_boards[:, iy_pairs, :, :])
 
         # Blocks constraints
         block_mask_1 = ix % 3 != iy % 3
         block_mask_2 = ix // 3 != iy // 3
         ix_pairs_block = ix[identity_mask & block_mask_1 & block_mask_2]
         iy_pairs_block = iy[identity_mask & block_mask_1 & block_mask_2]
-        blocks_different = check(blocks[:, :, ix_pairs_block, :], blocks[:, :, iy_pairs_block, :])
+        blocks_different = diff_fn(blocks[:, :, ix_pairs_block, :], blocks[:, :, iy_pairs_block, :])
 
         # All constraints
         sat = torch.cat([rows_at_least_one.view(batch_size, -1),

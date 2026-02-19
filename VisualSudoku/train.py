@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -6,6 +7,10 @@ from parse_data import get_datasets, get_MNIST_dataset
 from torch.utils.data import DataLoader
 from utils import confusion_matrix_MNIST
 import time
+
+# When False: no Gumbel noise, CNN uses log_softmax (outputs are log-probabilities)
+USE_NOISE = False
+LOG_HALF = math.log(0.5)  # threshold in log-space for accuracy when USE_NOISE is False
 
 BATCH_SIZE = 1024
 BATCH_SIZE_VAL = 10000000
@@ -42,13 +47,14 @@ for SPLIT in range(10):
     MNIST_dataloader = DataLoader(MNIST_dataset, batch_size=BATCH_SIZE_VAL, shuffle=True)
 
 
-    print(f'Starting with split {SPLIT}')
+    print(f'Starting with split {SPLIT} (use_noise={USE_NOISE})')
     # Model
-    model = SudokuModel().to(DEVICE)
+    model = SudokuModel(use_noise=USE_NOISE).to(DEVICE)
 
     optimizer = torch.optim.RMSprop(model.parameters(), lr=0.001)
 
-    criterion = torch.nn.BCEWithLogitsLoss()
+    # With USE_NOISE, model outputs logits and we use BCEWithLogitsLoss; with no noise, loss is -mean or -min (log-space)
+    criterion = torch.nn.BCEWithLogitsLoss() if USE_NOISE else None
 
     print('Start learning...')
 
@@ -66,9 +72,17 @@ for SPLIT in range(10):
             truth = model(puzzle)
 
             if e < EPOCHS_MAXSAT:
-                loss = criterion(truth, target)
+                if USE_NOISE:
+                    loss = criterion(truth, target)
+                else:
+                    # Log-space: maximize mean satisfaction => minimize -mean(truth)
+                    loss = -torch.mean(truth)
             else:
-                loss = criterion(torch.min(truth, dim=1)[0], target)
+                if USE_NOISE:
+                    loss = criterion(torch.min(truth, dim=1)[0], target)
+                else:
+                    # Log-space: maximize minimum satisfaction => minimize -min(truth)
+                    loss = -torch.min(truth, dim=1)[0].mean()
             loss.backward()
             optimizer.step()
 
@@ -81,7 +95,9 @@ for SPLIT in range(10):
                     puzzle = puzzle.to(DEVICE)
                     target = target.to(DEVICE)
 
-                    truth = torch.where(torch.min(model(puzzle), 1)[0] > 0., 1., 0.).to(DEVICE)
+                    min_sat = torch.min(model(puzzle), 1)[0]
+                    threshold = LOG_HALF if not USE_NOISE else 0.0
+                    truth = torch.where(min_sat > threshold, 1., 0.).to(DEVICE)
                     print(torch.sum(truth))
 
                     accuracy = torch.sum(torch.eq(target, truth)).float() / target.shape[0]
@@ -106,7 +122,9 @@ for SPLIT in range(10):
             puzzle = puzzle.to(DEVICE)
             target = target.to(DEVICE)
 
-            truth = torch.where(torch.min(model(puzzle), 1)[0] > 0., 1., 0.).to(DEVICE)
+            min_sat = torch.min(model(puzzle), 1)[0]
+            threshold = LOG_HALF if not USE_NOISE else 0.0
+            truth = torch.where(min_sat > threshold, 1., 0.).to(DEVICE)
             print(f'Number of predicted valid sudokus: {torch.sum(truth)}')
 
             accuracy = torch.sum(torch.eq(target, truth)).float() / target.shape[0]
