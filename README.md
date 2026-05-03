@@ -1,14 +1,17 @@
 # Gödel Trick
 
-**Source code for paper: “Noise to the Rescue: Escaping Local Minima in Neurosymbolic Local Search”**
+**Source code for paper: “Gradient-Based Optimization on Gödel Logic as Discrete Local Search”**
 
 If you use this software for academic research, please, cite our work using the following BibTeX:
 ```
-@article{daniele2025noise,
-  title={Noise to the Rescue: Escaping Local Minima in Neurosymbolic Local Search},
-  author={Daniele, Alessandro and van Krieken, Emile},
-  journal={arXiv preprint arXiv:2503.01817},
-  year={2025}
+@article{daniele2026gradientbasedoptimizationgodellogic,
+      title={Gradient-Based Optimization on G\"odel Logic as Discrete Local Search}, 
+      author={Alessandro Daniele and Emile van Krieken},
+      year={2026},
+      eprint={2503.01817},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2503.01817}, 
 }
 ```
 
